@@ -1,0 +1,7 @@
+该代码用于调用另一个worker中DO
+1、关键代码，必须跟要绑定的DO中的 durable_objects.bindings.name = MY_DURABLE_OBJECT 的 `MY_DURABLE_OBJECT`名字一样
+2、手动在CF后台绑定对应的DO对象，并且变量名称必须是`MY_DURABLE_OBJECT`
+3、所有修改都要重新部署一次才能生效。
+注意：环境变量不用在pages中设置，使用worker(DO)端的变量值。
+
+目的：`worker.username.workers.dev` 域名不能使用，但是 `*.pages.dev` 域名可以访问的情况，置换域名使用。

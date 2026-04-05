@@ -1,0 +1,25 @@
+# cloudflare worker
+package-lock.json
+
+# rust
+/**/target/
+
+# c#
+.vs
+**/.vs/
+*.user
+
+# ignore bin and obj directories in any subdirectory
+**/bin/
+**/obj/
+
+# executable files
+**/*.exe
+**/*.dll
+**/*.pdb
+
+# go
+*.sum
+
+/doc
+/markdown

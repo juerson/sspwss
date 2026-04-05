@@ -1,0 +1,20 @@
+根据router.go源码loadGeoIPDatabase()下面的顺序来使用，不存在才使用其它的，而不是合并一起使用，需要手动下载和更新。
+
+dbPaths := []string{
+    filepath.Join(exeDir, "mmdb", "Merged-IP.mmdb"),
+    filepath.Join(exeDir, "mmdb", "Country.mmdb"),
+    filepath.Join(exeDir, "mmdb", "GeoLite2-Country.mmdb"),
+    filepath.Join(exeDir, "mmdb", "GeoIP2-Country.mmdb"),
+}
+
+手动下载地址：
+Merged-IP.mmdb
+https://github.com/NetworkCats/Merged-IP-Data
+
+Country.mmdb
+https://github.com/runetfreedom/russia-blocked-geoip
+https://github.com/Dreamacro/maxmind-geoip
+
+GeoLite2-Country.mmdb
+https://github.com/P3TERX/GeoLite.mmdb
+https://github.com/8bitsaver/maxmind-geoip

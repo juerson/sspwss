@@ -1,0 +1,5 @@
+普通worker，就部署worker，环境变量名称跟do的wrangler.jsonc一样（不推荐，无法自动重连，用着就断网，特别是空闲超时的）
+DO版worker，就部署do（推荐）
+pages域名在当地可以使用，想pages域名使用DO的，就部署do + pages
+
+如果都握手失败/非CF错误导致的无法使用，可以修改兼容日期尝试。

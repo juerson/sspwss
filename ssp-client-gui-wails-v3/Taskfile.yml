@@ -1,0 +1,27 @@
+version: '3'
+
+vars:
+  APP_NAME: "SSP Workers Client"
+  BIN_DIR: "build/bin"
+
+tasks:
+  # 生产构建：-H windowsgui 无黑框；图标/版本/DPI 清单由临时 syso 嵌入（官方流程）
+  # 等价命令：wails3 build
+  build:
+    summary: 生产构建（无黑框；图标/版本/DPI 清单自动嵌入）
+    cmds:
+      - task: generate:syso
+      - go build -tags production -trimpath -buildvcs=false -ldflags="-w -s -H windowsgui" -o "{{.BIN_DIR}}/{{.APP_NAME}}.exe"
+      - cmd: rm -f wails_windows_amd64.syso
+
+  # 调试构建：带控制台窗口（能看到 Wails INF 日志和 println 输出），用于排查问题
+  dev:
+    summary: 调试构建（带控制台日志）
+    cmds:
+      - go build -buildvcs=false -o "{{.BIN_DIR}}/{{.APP_NAME}}-dev.exe" .
+
+  generate:syso:
+    summary: 生成 Windows .syso（图标/清单/版本信息，链接时自动嵌入，构建后清理）
+    dir: build/windows
+    cmds:
+      - wails3 generate syso -arch amd64 -icon icon.ico -manifest wails.exe.manifest -info info.json -out ../../wails_windows_amd64.syso

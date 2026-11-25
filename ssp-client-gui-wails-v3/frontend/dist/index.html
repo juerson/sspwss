@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>SSP Workers Client</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <fieldset class="group" id="gServer">
+    <legend>服务器设置</legend>
+    <div class="row">
+      <label class="lbl" for="serverSelect">选择服务器</label>
+      <select id="serverSelect"></select>
+      <div class="hbtns">
+        <button id="btnAdd" type="button">新增</button>
+        <button id="btnSave" type="button">保存</button>
+        <button id="btnRename" type="button">重命名</button>
+        <button id="btnDel" type="button">删除</button>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>参数设置</legend>
+    <div class="grid">
+      <label class="lbl" for="fServer">服务器地址</label>
+      <input id="fServer" type="password" class="span3 mono" autocomplete="off" spellcheck="false" />
+
+      <label class="lbl" for="fToken">身份令牌</label>
+      <input id="fToken" type="password" class="mono" autocomplete="off" spellcheck="false" />
+      <label class="lbl lbl-link" id="lblCidrs" title="点击打开优选地址（CIDR）数据库管理窗口">优选地址</label>
+      <input id="fIp" type="password" class="mono" autocomplete="off" spellcheck="false" />
+
+      <label class="lbl" for="fDns" title="ECH 查询用的 DoH 服务器。Go 核心支持域名或 IP；Rust 核心仅支持 IP（填域名时 Rust 用其内置默认）">DOH地址</label>
+      <input id="fDns" type="text" class="mono" placeholder="如 dns.alidns.com/dns-query 或 https://223.5.5.5/dns-query" autocomplete="off" spellcheck="false" />
+      <label class="lbl lbl-link" id="lblCsv" title="点击打开 ProxyIP 数据库管理窗口">ProxyIP</label>
+      <input id="fFallback" type="password" class="mono" autocomplete="off" spellcheck="false" />
+
+      <label class="lbl" for="fEch">ECH地址</label>
+      <input id="fEch" type="text" class="mono" autocomplete="off" spellcheck="false" />
+      <label class="lbl" for="fUseECH">开启ECH</label>
+      <select id="fUseECH">
+        <option value="true">启用</option>
+        <option value="false">禁用</option>
+      </select>
+
+      <label class="lbl" for="fUa">User-Agent</label>
+      <input id="fUa" type="text" class="mono" autocomplete="off" spellcheck="false" />
+      <label class="lbl" for="fRouting">路由分流</label>
+      <select id="fRouting">
+        <option value="rule">规则模式</option>
+        <option value="global">全局模式</option>
+        <option value="none">直连模式</option>
+      </select>
+
+      <label class="lbl" for="fListen">监听地址</label>
+      <input id="fListen" type="text" class="mono" autocomplete="off" spellcheck="false" />
+      <label class="lbl" for="fLogLevel" title="两个核心通用：Go 核心 -loglevel 参数；Rust 核心 RUST_LOG 环境变量（GUI 自动映射）">日志级别</label>
+      <select id="fLogLevel">
+        <option value="DEBUG">DEBUG</option>
+        <option value="INFO">INFO</option>
+        <option value="WARN">WARN</option>
+        <option value="ERROR">ERROR</option>
+      </select>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>控制</legend>
+    <div class="row">
+      <label class="lbl" for="coreSelect">核心</label>
+      <select id="coreSelect"></select>
+      <div class="spacer"></div>
+      <button id="btnStart" type="button" class="primary">启动</button>
+      <button id="btnStop" type="button" disabled>停止</button>
+    </div>
+    <div class="row checks">
+      <label class="chk"><input type="checkbox" id="cbProxy" /> 系统代理</label>
+      <label class="chk"><input type="checkbox" id="cbAutoStart" /> 开机启动</label>
+      <label class="chk"><input type="checkbox" id="cbAutoStartHide" /> 隐藏窗体</label>
+    </div>
+  </fieldset>
+
+  <fieldset class="group grow">
+    <legend>运行日志</legend>
+    <div class="row logbar">
+      <a href="javascript:void(0)" id="linkClearLog">清空日志</a>
+    </div>
+    <div id="logBox" tabindex="0"></div>
+  </fieldset>
+
+  <!-- 输入对话框（新增/重命名服务器） -->
+  <div id="dlgMask" class="dlg-mask" hidden>
+    <div class="dlg">
+      <div class="dlg-title" id="dlgTitle"></div>
+      <label id="dlgLabel" for="dlgInput"></label>
+      <input id="dlgInput" type="text" autocomplete="off" spellcheck="false" />
+      <div class="dlg-btns">
+        <button id="dlgOk" type="button" class="primary" disabled>确定</button>
+        <button id="dlgCancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 确认对话框（删除服务器） -->
+  <div id="cfmMask" class="dlg-mask" hidden>
+    <div class="dlg">
+      <div class="dlg-title" id="cfmTitle"></div>
+      <div class="dlg-msg" id="cfmMsg"></div>
+      <div class="dlg-btns">
+        <button id="cfmOk" type="button" class="primary">确定</button>
+        <button id="cfmCancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" hidden></div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

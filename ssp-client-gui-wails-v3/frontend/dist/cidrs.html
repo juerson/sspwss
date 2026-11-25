@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>优选地址管理</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body class="dbwin">
+  <fieldset class="group">
+    <legend>数据获取</legend>
+    <div class="row">
+      <label class="lbl" for="writeMode">写入方式</label>
+      <select id="writeMode">
+        <option value="append">追加写入(会去重)</option>
+        <option value="overwrite">覆盖写入(先清空)</option>
+      </select>
+      <label class="lbl" for="btnBuiltin">使用内置数据源:</label>
+      <button id="btnBuiltin" type="button">内置源下载</button>
+      <div class="spacer"></div>
+      <label class="lbl" for="btnMerge">导入本地文件:</label>
+      <button id="btnMerge" type="button">导入本地文件</button>
+    </div>
+    <div class="row">
+      <label class="lbl" for="urlInput">自定义下载:</label>
+      <input id="urlInput" type="text" class="mono grow-input" placeholder="输入 CIDR 数据 URL" autocomplete="off" spellcheck="false" />
+      <button id="btnUrl" type="button">下载</button>
+    </div>
+  </fieldset>
+
+  <fieldset class="group">
+    <legend>搜索</legend>
+    <div class="row">
+      <input id="searchInput" type="text" class="grow-input" placeholder="搜索 CIDR 或备注（模糊匹配，回车执行）" autocomplete="off" spellcheck="false" />
+    </div>
+  </fieldset>
+
+  <fieldset class="group grow">
+    <legend>数据浏览</legend>
+    <div class="row opsbar">
+      <button id="btnDelete" type="button" disabled>选中删除</button>
+      <button id="btnDedup" type="button">一键去重</button>
+      <button id="btnClear" type="button">清空全部</button>
+      <button id="btnRefresh" type="button">刷新</button>
+    </div>
+    <div class="tblwrap">
+      <table class="db" id="tbl">
+        <thead>
+          <tr>
+            <th class="cSel"><input type="checkbox" id="selAll" title="全选本页" /></th>
+            <th class="num">#</th>
+            <th style="width: 30%">CIDR 地址</th>
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="row pager">
+      <span id="pageInfo">第1/1页 | 当页0条/共0条</span>
+      <div class="spacer"></div>
+      <button id="btnPrev" type="button" disabled>&lt;</button>
+      <button id="btnNext" type="button" disabled>&gt;</button>
+    </div>
+  </fieldset>
+
+  <!-- 确认对话框（删除/清空/去重） -->
+  <div id="cfmMask" class="dlg-mask" hidden>
+    <div class="dlg">
+      <div class="dlg-title" id="cfmTitle"></div>
+      <div class="dlg-msg" id="cfmMsg"></div>
+      <div class="dlg-btns">
+        <button id="cfmOk" type="button" class="primary">确定</button>
+        <button id="cfmCancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" hidden></div>
+
+  <script type="module" src="./cidrs.js"></script>
+</body>
+</html>

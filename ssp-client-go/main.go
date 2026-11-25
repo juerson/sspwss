@@ -23,7 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +56,7 @@ var (
 	echDomain      string
 	routingMode    string
 	ruleConfigPath string
+	dnsConfigPath  string
 	userAgent      string
 	fallbackTarget string
 	logLevelStr    string
@@ -70,14 +71,23 @@ func init() {
 	flag.StringVar(&serverAddr, "f", "", "worker地址 (格式: your.worker.dev:443)")
 	flag.StringVar(&serverIP, "ip", "", "本地IP，多IP用逗号分隔")
 	flag.StringVar(&token, "token", "", "身份验证令牌(PSK)")
-	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH查询DoH服务器")
+	flag.StringVar(&dnsServer, "dns", "https://223.5.5.5/dns-query", "ECH查询DoH服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH查询域名")
-	flag.StringVar(&routingMode, "routing", "global", "路由模式: global bypass_cn rule none")
+	flag.StringVar(&routingMode, "routing", "rule", "路由模式: bypass_cn / rule(默认，rules.yaml 规则引擎) global none")
 	flag.StringVar(&ruleConfigPath, "rule-config", "rules.yaml", "规则配置文件路径")
+	flag.StringVar(&dnsConfigPath, "dns-config", "dns.yaml", "DNS防泄漏配置文件路径")
 	flag.StringVar(&userAgent, "ua", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36", "自定义User-Agent")
 	flag.StringVar(&fallbackTarget, "fallback", "", "备用连接目标，逗号分隔多个IP:Port")
 	flag.StringVar(&logLevelStr, "loglevel", "INFO", "日志级别: DEBUG, INFO, WARN, ERROR")
 	flag.BoolVar(&useECH, "use-ech", false, "是否启用ECH")
+}
+
+// resolveExeRelative 路径解析：绝对路径直用，相对路径基于可执行文件目录
+func resolveExeRelative(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(exeDir, path)
 }
 
 // =============================================================================
@@ -95,6 +105,25 @@ func main() {
 		log.Fatal("必须指定 -f 服务端地址 和 -token 令牌\n示例:\n  ./client -l 127.0.0.1:30000 -f your.worker.dev:443 -token YOUR-PSK")
 	}
 
+	// ── 1. DNS 配置：联网前校验，非法配置直接退出 ──────────────────────────────
+	// dns.yaml 不存在 → 内置默认（内部解析全走隧道，不开本地监听器，默认安全）。
+	dnsCfg, err := loadDnsConfig(resolveExeRelative(dnsConfigPath))
+	if err != nil {
+		logError("%v", err)
+		os.Exit(1)
+	}
+	setDnsConfig(dnsCfg)
+	logInfo("[DNS] 配置: listen=%q, ipv6=%v, nameserver=%v, direct=%v, policy=%d",
+		dnsCfg.Listen, dnsCfg.IPv6,
+		describeUpstreamSpecs(dnsCfg.Nameserver),
+		describeUpstreamSpecs(dnsCfg.DirectNameserver),
+		len(dnsCfg.NameserverPolicy))
+
+	// ── 2. 引导解析器（字面 IP DoH）：解析 worker 域名 / DoH 域名端点 ───────────
+	// 隧道端点的解析永不经过主解析器，防止解析循环（bootstrap 边界）
+	globalBootstrap = newBootstrapResolver(dnsCfg.effectiveBootstrapServers())
+
+	// ── 3. IP 池：-ip 里的域名经引导 DoH 解析，系统 DNS 不接触 worker 域名 ─────
 	initCFCIDRPool()
 
 	initServerIPList()
@@ -103,6 +132,7 @@ func main() {
 		logInfo("[配置] 用户IP池为空，将使用内置CF轮换池")
 	}
 
+	// ── 4. ECH：DoH 取 HTTPS RR 的 ech 参数（不经隧道，无循环依赖）─────────────
 	if useECH {
 		logInfo("[启动] 获取 ECH 配置...")
 		if err := updateECH(); err != nil {
@@ -124,27 +154,39 @@ func main() {
 		logInfo("[启动] ECH 已禁用")
 	}
 
+	// ── 5. 路由：加载规则引擎（顺带统计是否存在需要解析的 IP 谓词规则）─────────
+	// rule 模式读 rules.yaml（clash 风格规则文件）；国内 IP 判定走 GEOIP(mmdb)。
 	InitRouter(routingMode, ruleConfigPath)
 
-	if routingMode == "bypass_cn" {
-		go initRouting()
+	// ── 6. DNS 解析器（tunnel:// 上游复用隧道连接池）────────────────────────────
+	// 解析器注入路由分类器：DIRECT 目标用 direct-nameserver（国内 DoH，geo 正确），
+	// PROXY/未知目标用 nameserver（默认 tunnel://，解析位置跟随出口）。
+	var classifier RouteClassifier
+	if rt := GetRouter(); rt != nil {
+		classifier = rt
+	}
+	resolver, err := newDnsResolver(dnsCfg, classifier)
+	if err != nil {
+		logError("DNS 初始化失败: %v", err)
+		os.Exit(1)
+	}
+	setDnsResolver(resolver)
+
+	// ── 7. 可选本地 DNS 监听器（UDP+TCP）：系统/浏览器可把 DNS 指向此端口 ──────
+	if dnsCfg.Listen != "" {
+		if err := startDnsListener(dnsCfg.Listen, resolver); err != nil {
+			logError("DNS 监听器启动失败: %v", err)
+			os.Exit(1)
+		}
 	}
 
-	go warmupDNSCache()
-
-	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			globalDNSCache.cleanupExpired()
-		}
-	}()
-
+	// ── 8. 连接池预热，在第一个请求到来前预建 WS 连接 ──────────────────────────
+	// 保持 3 条热空闲连接（RS POOL_SIZE=3 同款）：突发并发时零拨号等待
 	go func() {
 		ticker := time.NewTicker(poolWarmUpInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			globalPool.warmUp(2)
+			globalPool.warmUp(3)
 		}
 	}()
 
@@ -170,19 +212,18 @@ const (
 	heartbeatTimeout   = 60 * time.Second
 	heartbeatInterval  = 15 * time.Second
 
-	poolWarmUpInterval = 15 * time.Second
+	poolWarmUpInterval = 10 * time.Second
 
-	dnsCacheTTL           = 5 * time.Minute
-	echRefreshPeriod      = 6 * time.Hour
-	ipListExpiry          = 3 * 24 * time.Hour
-	ipListDownloadTimeout = 15 * time.Second
-	dnsQueryTimeout       = 500 * time.Millisecond
+	dnsCacheTTL      = 5 * time.Minute
+	echRefreshPeriod = 6 * time.Hour
+	dnsQueryTimeout  = 500 * time.Millisecond
 
 	timeWindowSec = 300
 
 	TYPE_DATA  = 0x01
 	TYPE_OPEN  = 0x02
 	TYPE_CLOSE = 0x03
+	TYPE_DNS   = 0x04 // v1.5：DNS 查询帧（payload = reqId(2B) + wire query），sid=0
 	TYPE_HEART = 0x05
 	NONCE_SIZE = 12
 	TAG_SIZE   = 16
@@ -311,7 +352,10 @@ func initServerIPList() {
 
 		if isDomain(p) {
 			logInfo("[配置] 检测到域名: %s，将进行DNS解析", p)
-			if ips, err := net.LookupHost(p); err == nil && len(ips) > 0 {
+			// 经引导 DoH（proxy-server-nameserver/default-nameserver）解析 worker
+			// 域名：系统 DNS 不再看到隧道端点（防残余泄漏面）
+			ips, err := bootstrapResolveHosts(p)
+			if err == nil && len(ips) > 0 {
 				for _, ip := range ips {
 					if err := serverCIDRPool.AddCIDR(ip); err != nil {
 						logWarn("[配置] 跳过域名解析的IP %q: %v", ip, err)
@@ -403,99 +447,9 @@ func logError(format string, v ...any) {
 // =============================================================================
 // DNS 缓存系统
 // =============================================================================
-
-type dnsCacheEntry struct {
-	addrs   []net.IPAddr
-	expires time.Time
-	access  time.Time
-}
-
-type dnsCache struct {
-	mu         sync.RWMutex
-	store      map[string]dnsCacheEntry
-	maxEntries int
-}
-
-func (c *dnsCache) get(host string) ([]net.IPAddr, bool) {
-	c.mu.Lock()
-	e, ok := c.store[host]
-	if ok && time.Now().Before(e.expires) {
-		e.access = time.Now()
-		c.store[host] = e
-		c.mu.Unlock()
-		return e.addrs, true
-	}
-	c.mu.Unlock()
-	return nil, false
-}
-
-func (c *dnsCache) set(host string, addrs []net.IPAddr) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	now := time.Now()
-	c.store[host] = dnsCacheEntry{
-		addrs:   addrs,
-		expires: now.Add(dnsCacheTTL),
-		access:  now,
-	}
-
-	if len(c.store) > c.maxEntries {
-		c.evictLRU()
-	}
-}
-
-func (c *dnsCache) evictLRU() {
-	if len(c.store) <= c.maxEntries {
-		return
-	}
-
-	var oldestHost string
-	var oldestTime time.Time
-	first := true
-
-	for host, entry := range c.store {
-		if first || entry.access.Before(oldestTime) {
-			oldestHost = host
-			oldestTime = entry.access
-			first = false
-		}
-	}
-
-	if oldestHost != "" {
-		delete(c.store, oldestHost)
-		logDebug("[DNS] 缓存已满，清理最久未访问条目: %s", oldestHost)
-	}
-}
-
-func (c *dnsCache) cleanupExpired() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	now := time.Now()
-	expired := make([]string, 0)
-
-	for host, entry := range c.store {
-		if now.After(entry.expires) {
-			expired = append(expired, host)
-		}
-	}
-
-	for _, host := range expired {
-		delete(c.store, host)
-	}
-
-	if len(expired) > 0 {
-		logDebug("[DNS] 清理过期条目: %d 个", len(expired))
-	}
-}
-
-var globalDNSCache = &dnsCache{
-	store:      make(map[string]dnsCacheEntry),
-	maxEntries: 1000,
-}
-
-var dnsQueryGroup singleflight.Group
+// DNS 解析统一走 dns.go 的 DnsResolver
+// （真实 TTL + singleflight + 失败不缓存），路由 IP 匹配与直连建连共用同一份
+// resolver 缓存，避免重复查询消耗 worker 子请求预算。
 
 // =============================================================================
 // 重放攻击防护
@@ -1009,7 +963,13 @@ func updateECH() error {
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := (&http.Client{Timeout: connTimeout}).Do(req)
+	// 域名端点经引导 DoH 解析并钉住 IP（TLS SNI 仍用原域名）；
+	// 禁用系统代理，防止解析环/流量绕道
+	client, err := newPinnedDoHClient(dohURL)
+	if err != nil {
+		return fmt.Errorf("构造 DoH 客户端失败: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1521,7 +1481,7 @@ func handleSOCKS5(conn net.Conn, clientAddr string) {
 	logDebug("[SOCKS5] %s -> %s", clientAddr, target)
 
 	var err error
-	switch getRouteAction(host) {
+	switch getRouteAction(host, port) {
 	case RuleActionReject:
 		logInfo("🚫 %s -> %s (已拒绝)", clientAddr, target)
 		conn.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -1595,12 +1555,16 @@ func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 	if method == "CONNECT" {
 		logDebug("[HTTP] CONNECT %s <- %s", requestURL, clientAddr)
 
-		targetHost, _, _ := net.SplitHostPort(requestURL)
+		targetHost, targetPort, _ := net.SplitHostPort(requestURL)
 		if targetHost == "" {
 			targetHost = requestURL
 		}
+		port := uint16(443)
+		if p, err := strconv.ParseUint(targetPort, 10, 16); err == nil {
+			port = uint16(p)
+		}
 
-		switch getRouteAction(targetHost) {
+		switch getRouteAction(targetHost, port) {
 		case RuleActionReject:
 			logInfo("🚫 %s -> %s (已拒绝)", clientAddr, requestURL)
 			conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"))
@@ -1633,12 +1597,16 @@ func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 	copy(firstPayload, rawBytes)
 	copy(firstPayload[len(rawBytes):], extra)
 
-	targetHost, _, _ := net.SplitHostPort(target)
+	targetHost, targetPort, _ := net.SplitHostPort(target)
 	if targetHost == "" {
 		targetHost = host
 	}
+	httpPort := uint16(80)
+	if p, err := strconv.ParseUint(targetPort, 10, 16); err == nil {
+		httpPort = uint16(p)
+	}
 
-	switch getRouteAction(targetHost) {
+	switch getRouteAction(targetHost, httpPort) {
 	case RuleActionReject:
 		logInfo("🚫 %s -> %s (已拒绝)", clientAddr, target)
 		response := "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
@@ -1654,15 +1622,23 @@ func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 }
 
 func handleDirectConnection(conn net.Conn, target, clientAddr string, mode int, firstPayload []byte) error {
-	if _, _, err := net.SplitHostPort(target); err != nil {
-		port := "80"
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+		port = "80"
 		if mode == 2 {
 			port = "443"
 		}
-		target = net.JoinHostPort(target, port)
 	}
 
-	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
+	// 域名必须经 DnsResolver 解析（fail-closed：失败即拒绝，绝不走系统解析）
+	ips, err := resolveHostIPs(host)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return fmt.Errorf("直连解析 %s: %w", host, err)
+	}
+
+	targetConn, err := dialIPRacing(ips, port, dialTimeout)
 	if err != nil {
 		sendErrorResponse(conn, mode)
 		return fmt.Errorf("直连失败: %w", err)
@@ -1773,283 +1749,10 @@ func getExeDir() string {
 }
 
 // =============================================================================
-// IP 列表管理
-// =============================================================================
-
-func initRouting() {
-	logInfo("[分流] 中国 IP 库加载中...")
-	setupIPList("IPv4", ipv4LocalFile, ipv4Mirrors, reloadV4ToMemory)
-	setupIPList("IPv6", ipv6LocalFile, ipv6Mirrors, reloadV6ToMemory)
-}
-
-func setupIPList(label, path string, mirrors []string, reload func() error) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		logInfo("[分流] 下载 %s 列表...", label)
-		if err := downloadIPList(path, mirrors); err != nil {
-			logWarn("[分流] %s 下载失败：%v", label, err)
-			return
-		}
-	} else if isFileOld(path) {
-		go func() {
-			logInfo("[分流] 后台更新 %s...", label)
-			if err := downloadIPList(path, mirrors); err == nil {
-				_ = reload()
-			}
-		}()
-	}
-	_ = reload()
-}
-
-func isFileOld(path string) bool {
-	info, err := os.Stat(path)
-	return err != nil || time.Since(info.ModTime()) > ipListExpiry
-}
-
-func IsChinaIP(ip net.IP) bool {
-	if ip4 := ip.To4(); ip4 != nil {
-		return isChinaIPv4(ipToUint32(ip4))
-	}
-	if ip16 := ip.To16(); ip16 != nil {
-		return isChinaIPv6(ip16)
-	}
-	return false
-}
-
-func isChinaIPv4(v uint32) bool {
-	ranges := chinaIPRanges.Load()
-	if ranges == nil || len(*ranges) == 0 {
-		return false
-	}
-	return binarySearchIPv4(v, *ranges)
-}
-
-func isChinaIPv6(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	ranges := chinaIPV6Ranges.Load()
-	if ranges == nil || len(*ranges) == 0 {
-		return false
-	}
-	var a [16]byte
-	copy(a[:], ip)
-	return binarySearchIPv6(a, *ranges)
-}
-
-func binarySearchIPv4(v uint32, ranges []ipRange) bool {
-	i := sort.Search(len(ranges), func(j int) bool {
-		return ranges[j].start > v
-	})
-	return i > 0 && ranges[i-1].end >= v
-}
-
-func binarySearchIPv6(ip [16]byte, ranges []ipRangeV6) bool {
-	i := sort.Search(len(ranges), func(j int) bool {
-		return bytes.Compare(ranges[j].start[:], ip[:]) > 0
-	})
-	return i > 0 && bytes.Compare(ranges[i-1].end[:], ip[:]) >= 0
-}
-
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip)
-}
-
-func parseIPLine(line string) (net.IP, net.IP, bool) {
-	line = strings.TrimSpace(line)
-	if line == "" || strings.HasPrefix(line, "#") {
-		return nil, nil, false
-	}
-
-	if ip := net.ParseIP(line); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			return ip4, ip4, true
-		}
-		return ip, ip, true
-	}
-
-	if _, ipnet, err := net.ParseCIDR(line); err == nil {
-		start := ipnet.IP
-		end := make(net.IP, len(start))
-		for i := range start {
-			end[i] = start[i] | ^ipnet.Mask[i]
-		}
-		return start, end, true
-	}
-
-	if parts := strings.Fields(line); len(parts) >= 2 {
-		s := net.ParseIP(parts[0])
-		e := net.ParseIP(parts[1])
-		if s != nil && e != nil {
-			return s, e, true
-		}
-	}
-
-	return nil, nil, false
-}
-
-func mergeIPRanges(sorted []ipRange) []ipRange {
-	if len(sorted) == 0 {
-		return sorted
-	}
-	merged := make([]ipRange, 0, len(sorted))
-	current := sorted[0]
-
-	for _, next := range sorted[1:] {
-		if next.start <= current.end+1 {
-			if next.end > current.end {
-				current.end = next.end
-			}
-		} else {
-			merged = append(merged, current)
-			current = next
-		}
-	}
-	return append(merged, current)
-}
-
-func mergeIPRangesV6(sorted []ipRangeV6) []ipRangeV6 {
-	if len(sorted) == 0 {
-		return sorted
-	}
-	merged := make([]ipRangeV6, 0, len(sorted))
-	current := sorted[0]
-
-	for _, next := range sorted[1:] {
-		if bytes.Compare(next.start[:], current.end[:]) <= 0 {
-			if bytes.Compare(next.end[:], current.end[:]) > 0 {
-				current.end = next.end
-			}
-		} else {
-			merged = append(merged, current)
-			current = next
-		}
-	}
-	return append(merged, current)
-}
-
-func reloadV4ToMemory() error { return loadIPListToMemory(ipv4LocalFile, true) }
-func reloadV6ToMemory() error { return loadIPListToMemory(ipv6LocalFile, false) }
-
-func loadIPListToMemory(path string, isV4 bool) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	var tmp4 []ipRange
-	var tmp6 []ipRangeV6
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for sc.Scan() {
-		s, e, ok := parseIPLine(sc.Text())
-		if !ok {
-			continue
-		}
-
-		if isV4 {
-			sv := ipToUint32(s)
-			ev := ipToUint32(e)
-			if sv > ev {
-				continue
-			}
-			tmp4 = append(tmp4, ipRange{sv, ev})
-		} else if s.To4() == nil {
-			var r ipRangeV6
-			copy(r.start[:], s.To16())
-			copy(r.end[:], e.To16())
-			if bytes.Compare(r.start[:], r.end[:]) > 0 {
-				continue
-			}
-			tmp6 = append(tmp6, r)
-		}
-	}
-
-	if err := sc.Err(); err != nil {
-		return err
-	}
-
-	if isV4 {
-		sort.Slice(tmp4, func(i, j int) bool {
-			return tmp4[i].start < tmp4[j].start
-		})
-		tmp4 = mergeIPRanges(tmp4)
-
-		r := tmp4
-		chinaIPRanges.Store(&r)
-
-		logInfo("[分流] IPv4: %d 条 (已合并)", len(tmp4))
-	} else {
-		sort.Slice(tmp6, func(i, j int) bool {
-			return bytes.Compare(tmp6[i].start[:], tmp6[j].start[:]) < 0
-		})
-		tmp6 = mergeIPRangesV6(tmp6)
-
-		r := tmp6
-		chinaIPV6Ranges.Store(&r)
-
-		logInfo("[分流] IPv6: %d 条 (已合并)", len(tmp6))
-	}
-
-	return nil
-}
-
-func downloadIPList(localPath string, mirrors []string) error {
-	client := &http.Client{Timeout: ipListDownloadTimeout}
-	tmpPath := localPath + ".tmp"
-	var lastErr error
-
-	for _, url := range mirrors {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", userAgent)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			continue
-		}
-
-		out, err := os.Create(tmpPath)
-		if err != nil {
-			resp.Body.Close()
-			return err
-		}
-
-		n, copyErr := io.Copy(out, resp.Body)
-		out.Close()
-		resp.Body.Close()
-
-		if copyErr == nil && n > 1024 {
-			return os.Rename(tmpPath, localPath)
-		}
-
-		os.Remove(tmpPath)
-		lastErr = copyErr
-	}
-
-	return lastErr
-}
-
-// =============================================================================
 // 路由和DNS管理
 // =============================================================================
 
-func getRouteAction(host string) RuleAction {
+func getRouteAction(host string, port uint16) RuleAction {
 	switch routingMode {
 	case "none":
 		return RuleActionDirect
@@ -2057,75 +1760,300 @@ func getRouteAction(host string) RuleAction {
 		return RuleActionProxy
 	default:
 		// bypass_cn、rule 模式
-		return RouteDomain(host, nil, 443)
+		return RouteDomain(host, nil, port)
 	}
 }
 
-func warmupDNSCache() {
-	commonDomains := []string{
-		"google.com",
-		"youtube.com",
-		"facebook.com",
-		"twitter.com",
-		"instagram.com",
-		"github.com",
-		"stackoverflow.com",
-		"reddit.com",
-		"wikipedia.org",
-		"amazon.com",
-		"netflix.com",
-		"linkedin.com",
-		"microsoft.com",
-		"apple.com",
-		"cloudflare.com",
+// resolveHostIPs 直连/路由的域名解析（fail-closed）：
+//   - 字面 IP / localhost → 不触发 DNS；
+//   - 其它域名 → DnsResolver（按路由分类选组：DIRECT → direct-nameserver，
+//     PROXY/未知 → tunnel://）；解析器未接线或解析失败一律报错，
+//     绝不回退系统解析（防泄漏第一性原理）。
+func resolveHostIPs(host string) ([]net.IP, error) {
+	host = strings.TrimPrefix(strings.TrimPrefix(host, "["), "]")
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{canonicalIP(ip)}, nil
+	}
+	if strings.EqualFold(host, "localhost") {
+		// 本地回环：绝不该把 localhost 送去远端 DoH
+		return []net.IP{net.IPv4(127, 0, 0, 1), net.ParseIP("::1").To16()}, nil
+	}
+	resolver := getDnsResolver()
+	if resolver == nil {
+		return nil, fmt.Errorf("DNS 解析器未接线 (fail-closed)")
+	}
+	return resolver.Resolve(host)
+}
+
+// dialIPRacing 多地址并行竞速拨号（happy eyeballs 简化版）：geo 不符的第一个
+// IP 不再拖住整个连接，避免 10s 干等变白屏。
+func dialIPRacing(ips []net.IP, port string, timeout time.Duration) (net.Conn, error) {
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("没有可用地址")
+	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan dialResult, len(ips))
+	for _, ip := range ips {
+		go func(ip net.IP) {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), port), timeout)
+			if conn != nil {
+				if tc, ok := conn.(*net.TCPConn); ok {
+					// 直连出口关 Nagle：交互式流量（TLS 握手小包、SSH）最多可省 200ms
+					_ = tc.SetNoDelay(true)
+				}
+			}
+			ch <- dialResult{conn: conn, err: err}
+		}(ip)
 	}
 
-	logInfo("[DNS预热] 开始预热 %d 个常用域名...", len(commonDomains))
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 5)
-
-	for _, domain := range commonDomains {
-		wg.Add(1)
-		go func(host string) {
-			defer wg.Done()
-
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			if _, ok := globalDNSCache.get(host); ok {
-				return
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err == nil && len(addrs) > 0 {
-				globalDNSCache.set(host, addrs)
-				logDebug("[DNS预热] 成功预热: %s (%d个IP)", host, len(addrs))
-			}
-		}(domain)
+	var lastErr error
+	for i := 0; i < len(ips); i++ {
+		r := <-ch
+		if r.err == nil {
+			// 竞速期间可能有其它成功连接，后台回收（通道有缓冲，不会阻塞）
+			go func(remaining int) {
+				for j := 0; j < remaining; j++ {
+					extra := <-ch
+					if extra.conn != nil {
+						extra.conn.Close()
+					}
+				}
+			}(len(ips) - i - 1)
+			return r.conn, nil
+		}
+		lastErr = r.err
 	}
-
-	wg.Wait()
-	logInfo("[DNS预热] 完成")
+	return nil, lastErr
 }
 
 const (
-	maxPoolConns      = 50
-	maxStreamsPerConn = 10
-	maxTotalServed    = 50
+	maxPoolConns = 50
+	// 单连接并发流上限：对齐 worker MAX_CONNECTIONS=32（留余量）。
+	// 旧值 10 会迫使高并发场景（网页加载 30+ 连接）频繁同步拨新连接，
+	// 每次 TLS+WS+握手要 2~3 个 RTT，是"不如 RS 版流畅"的主要原因之一。
+	maxStreamsPerConn = 24
+	// 单连接累计服役流数：主动退役点。worker 免费计划每会话只有 45 个
+	// 子请求预算（每次 OPEN 消耗 1 个），40 提前退役避免 OPEN 被 worker
+	// 拒绝后的无效往返；退役后由连接池预热自动补位。
+	maxTotalServed = 40
+
+	// 隧道 DNS（TYPE_DNS 帧）
+	dnsExchangeTimeout  = 10 * time.Second // 单次 DNS 帧交换超时
+	dnsUnsupportedLimit = 2                // 连续超时 N 次判定 worker 未部署 DNS 帧
+	maxInflightDNS      = 64               // DNS 帧并发上限（与 worker DNS_MAX_INFLIGHT 对齐）
 )
+
+// ── 隧道 DNS（TYPE_DNS 帧，sid=0，不占流 ID 空间）────────────────────────────
+
+// dnsReply 单次 DNS 帧交换的应答
+type dnsReply struct {
+	data []byte
+	err  error
+}
+
+// dnsReqIDCounter DNS reqId 分配（进程内原子递增，u16 回绕）
+var dnsReqIDCounter uint32
+
+// registerDNS 登记 in-flight DNS 请求，返回 reqId 与应答通道。
+// reqId 分配与登记同锁（防止回绕碰撞时双写同 ID）。
+func (pc *pooledConn) registerDNS() (uint16, chan dnsReply, error) {
+	ch := make(chan dnsReply, 1)
+	pc.dnsMu.Lock()
+	defer pc.dnsMu.Unlock()
+	if pc.dead {
+		return 0, nil, errors.New("连接已关闭")
+	}
+	for i := 0; i < 0xFFFF; i++ {
+		id := uint16(atomic.AddUint32(&dnsReqIDCounter, 1) & 0xFFFF)
+		if id == 0 {
+			continue
+		}
+		if _, ok := pc.dnsPending[id]; ok {
+			continue
+		}
+		pc.dnsPending[id] = ch
+		return id, ch, nil
+	}
+	return 0, nil, errors.New("DNS reqId 耗尽")
+}
+
+func (pc *pooledConn) completeDNS(reqID uint16, resp []byte) {
+	pc.dnsMu.Lock()
+	ch, ok := pc.dnsPending[reqID]
+	if ok {
+		delete(pc.dnsPending, reqID)
+	}
+	pc.dnsMu.Unlock()
+	if ok {
+		ch <- dnsReply{data: resp}
+	}
+}
+
+func (pc *pooledConn) removeDNS(reqID uint16) {
+	pc.dnsMu.Lock()
+	delete(pc.dnsPending, reqID)
+	pc.dnsMu.Unlock()
+}
+
+// failAllDNS 连接死亡时失败所有在途 DNS 请求（防止请求挂死到超时）
+func (pc *pooledConn) failAllDNS(reason string) {
+	pc.dnsMu.Lock()
+	pending := pc.dnsPending
+	pc.dnsPending = make(map[uint16]chan dnsReply)
+	pc.dnsMu.Unlock()
+	for _, ch := range pending {
+		ch <- dnsReply{err: errors.New(reason)}
+	}
+}
+
+// dnsExchange 经该连接发一次 DNS 帧并等待响应
+func (pc *pooledConn) dnsExchange(query []byte, timeout time.Duration) ([]byte, error) {
+	reqID, ch, err := pc.registerDNS()
+	if err != nil {
+		return nil, err
+	}
+
+	payload := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(payload, reqID)
+	copy(payload[2:], query)
+
+	if err := pc.writeFrame(TYPE_DNS, 0, payload); err != nil {
+		pc.removeDNS(reqID)
+		// 发送失败说明连接已坏：标记死亡并回收，避免下次再选中它
+		pc.closeConnection()
+		return nil, fmt.Errorf("WS 无法发送 DNS 帧: %w", err)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-timer.C:
+		pc.removeDNS(reqID)
+		return nil, errors.New("DNS 查询超时（若持续出现，说明 worker 未部署 DNS 帧，请更新 ssp-server/worker/worker.js 并重新部署）")
+	}
+}
+
+func (pc *pooledConn) isAlive() bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return !pc.dead
+}
+
+var (
+	dnsInflightSem = make(chan struct{}, maxInflightDNS)
+	dnsUnsupported atomic.Int32 // 连续超时计数（成功即清零；≥2 快速失败）
+)
+
+// pickDNSConn 从池里挑一条活连接承载 DNS 帧（DNS 不 allocStream，
+// 有存量流的连接同样可用）；池空则现拨一条。
+func pickDNSConn() (*pooledConn, error) {
+	globalPool.mu.RLock()
+	for _, c := range globalPool.conns {
+		if c.isAlive() {
+			globalPool.mu.RUnlock()
+			return c, nil
+		}
+	}
+	globalPool.mu.RUnlock()
+	return globalPool.createNewConn()
+}
+
+// tunnelDNSExchange DNS wire 查询 → wire 响应（经 TYPE_DNS 帧 → Worker DoH）。
+// 并发槽位限制 + 连续超时判定 worker 未部署 DNS 帧（快速失败，避免每个查询
+// 干等 10s）。移植自 ssp-client-rs mux.rs TunnelDns。
+func tunnelDNSExchange(query []byte) ([]byte, error) {
+	if dnsUnsupported.Load() >= dnsUnsupportedLimit {
+		return nil, errors.New("worker 不支持 DNS 帧（DNS 查询已连续超时），请更新 ssp-server/worker/worker.js 并重新部署")
+	}
+	dnsInflightSem <- struct{}{}
+	defer func() { <-dnsInflightSem }()
+
+	pc, err := pickDNSConn()
+	if err != nil {
+		return nil, fmt.Errorf("DNS 隧道连接不可用: %w", err)
+	}
+	data, err := pc.dnsExchange(query, dnsExchangeTimeout)
+	if err != nil {
+		if strings.Contains(err.Error(), "超时") {
+			if n := dnsUnsupported.Add(1); n == dnsUnsupportedLimit {
+				logWarn("[DNS] 隧道 DNS 连续超时，判定 worker 未部署 DNS 帧；后续查询将快速失败")
+			}
+		}
+		return nil, err
+	}
+	dnsUnsupported.Store(0)
+	return data, nil
+}
 
 // =============================================================================
 // 流管理和多路复用
 // =============================================================================
 
+// streamState 逻辑流接收队列 —— unbounded（RS mpsc::Unbounded 同款语义）。
+//
+// 关键：readLoop 派发数据帧**绝不丢弃**。旧实现用 32 帧缓冲 channel、满了静默
+// 丢弃，丢一帧内层 TCP 字节流就损坏（TLS 记录 MAC 失败），浏览器只能中断重连
+// —— 表现为下载/网页卡顿。队列容量仅受内存限制，消费端（relay）通常及时排空。
 type streamState struct {
-	ch     chan []byte
+	mu     sync.Mutex
+	queue  [][]byte
+	notify chan struct{} // cap 1：队列从空到非空的通知
 	once   sync.Once
 	closed chan struct{}
+}
+
+func newStreamState() *streamState {
+	return &streamState{notify: make(chan struct{}, 1), closed: make(chan struct{})}
+}
+
+func (ss *streamState) push(data []byte) {
+	ss.mu.Lock()
+	ss.queue = append(ss.queue, data)
+	ss.mu.Unlock()
+	select {
+	case ss.notify <- struct{}{}:
+	default:
+	}
+}
+
+// tryPop 非阻塞取一条
+func (ss *streamState) tryPop() ([]byte, bool) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if len(ss.queue) == 0 {
+		return nil, false
+	}
+	data := ss.queue[0]
+	ss.queue[0] = nil
+	ss.queue = ss.queue[1:]
+	return data, true
+}
+
+// pop 阻塞取一条；ctx 取消时提前返回 (nil, false)。
+// 流关闭后仍排空队列中已收到的数据（RS mpsc 语义），排空才返回 false。
+func (ss *streamState) pop(ctx context.Context) ([]byte, bool) {
+	for {
+		if data, ok := ss.tryPop(); ok {
+			return data, true
+		}
+		select {
+		case <-ss.notify:
+			// 回到循环 tryPop（可能已被并发取走）
+		case <-ss.closed:
+			// 关闭后排空残余，防止丢已收数据
+			if data, ok := ss.tryPop(); ok {
+				return data, true
+			}
+			return nil, false
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
 }
 
 func (ss *streamState) closeStream() {
@@ -2142,6 +2070,11 @@ type pooledConn struct {
 	nextSID     uint32
 	dead        bool
 	totalServed int
+
+	// 隧道 DNS：在途请求表（reqId → 应答通道）。DNS 帧固定 sid=0，
+	// 不占流 ID 空间、不受 maxStreamsPerConn 约束。
+	dnsMu      sync.Mutex
+	dnsPending map[uint16]chan dnsReply
 }
 
 func (pc *pooledConn) allocStream() (byte, *streamState, bool) {
@@ -2169,10 +2102,7 @@ func (pc *pooledConn) allocStream() (byte, *streamState, bool) {
 		pc.nextSID++
 		sid := byte((pc.nextSID % 254) + 1)
 		if _, used := pc.streams[sid]; !used {
-			ss := &streamState{
-				ch:     make(chan []byte, 32),
-				closed: make(chan struct{}),
-			}
+			ss := newStreamState()
 			pc.streams[sid] = ss
 			pc.totalServed++
 			return sid, ss, true
@@ -2206,14 +2136,17 @@ func (pc *pooledConn) readLoop() {
 		switch msgType {
 		case TYPE_DATA, TYPE_HEART:
 			if ss != nil {
-				select {
-				case ss.ch <- payload:
-				default:
-				}
+				// unbounded 队列：绝不丢帧（丢帧=内层 TCP 流损坏→卡顿断连）
+				ss.push(payload)
 			}
 		case TYPE_CLOSE:
 			if ss != nil {
 				pc.freeStream(sid)
+			}
+		case TYPE_DNS:
+			// v1.5 DNS 帧：payload = reqId(2B BE) + wire 响应
+			if len(payload) >= 2 {
+				pc.completeDNS(binary.BigEndian.Uint16(payload[:2]), payload[2:])
 			}
 		}
 	}
@@ -2227,6 +2160,7 @@ func (pc *pooledConn) readLoop() {
 		sids = append(sids, sid)
 	}
 	pc.mu.Unlock()
+	pc.failAllDNS("隧道已断开")
 
 	for _, sid := range sids {
 		pc.freeStream(sid)
@@ -2321,20 +2255,39 @@ func tunnelGeneric(conn net.Conn, target string, respType int, firstFrame []byte
 		return err
 	}
 
-	select {
-	case <-ss.ch:
-	case <-ss.closed:
-		sendErrorResponse(conn, respType)
-		return errors.New("server rejected")
-	case <-ctx.Done():
-		return errors.New("context canceled")
-	case <-time.After(10 * time.Second):
-		sendErrorResponse(conn, respType)
-		return errors.New("handshake timeout")
+	// 等待服务端 OPEN ACK（worker 开流成功会先回一个空 DATA 帧）。
+	// 若先到的已是真实数据帧，也照常转发（ACK 帧与数据帧在同一条 WS 连接上有序）。
+	ackWait := time.NewTimer(10 * time.Second)
+	var ackData []byte
+waitAck:
+	for {
+		if d, ok := ss.tryPop(); ok {
+			ackData = d
+			break waitAck
+		}
+		select {
+		case <-ss.notify:
+			// loop 回去 tryPop
+		case <-ss.closed:
+			sendErrorResponse(conn, respType)
+			return errors.New("server rejected")
+		case <-ctx.Done():
+			return errors.New("context canceled")
+		case <-ackWait.C:
+			sendErrorResponse(conn, respType)
+			return errors.New("handshake timeout")
+		}
 	}
 
 	if err := sendSuccessResponse(conn, respType); err != nil {
 		return err
+	}
+
+	if len(ackData) > 0 {
+		// ACK 帧本应为空；若先到了真实数据（极端竞速），转发给客户端
+		if _, err := conn.Write(ackData); err != nil {
+			return err
+		}
 	}
 
 	if len(firstFrame) > 0 {
@@ -2367,24 +2320,18 @@ func tunnelGeneric(conn net.Conn, target string, respType int, firstFrame []byte
 
 	go func() {
 		defer cancel()
+		// Worker → 客户端：阻塞排空队列（流关闭后先排空残余再 EOF）
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			case data, ok := <-ss.ch:
-				if !ok {
-					errChan <- io.EOF
-					return
-				}
-				if len(data) > 0 {
-					if _, err := conn.Write(data); err != nil {
-						errChan <- err
-						return
-					}
-				}
-			case <-ss.closed:
+			data, ok := ss.pop(ctx)
+			if !ok {
 				errChan <- io.EOF
 				return
+			}
+			if len(data) > 0 {
+				if _, err := conn.Write(data); err != nil {
+					errChan <- err
+					return
+				}
 			}
 		}
 	}()
@@ -2617,6 +2564,7 @@ func (pc *pooledConn) closeConnection() {
 	pc.mu.Lock()
 	pc.dead = true
 	pc.mu.Unlock()
+	pc.failAllDNS("隧道已断开")
 	if pc.ws != nil {
 		pc.ws.Close()
 	}
@@ -2683,9 +2631,10 @@ func (p *wsPool) warmUp(n int) {
 
 func newPooledConn(ws *websocket.Conn, session *Session) *pooledConn {
 	pc := &pooledConn{
-		ws:      ws,
-		session: session,
-		streams: make(map[byte]*streamState),
+		ws:         ws,
+		session:    session,
+		streams:    make(map[byte]*streamState),
+		dnsPending: make(map[uint16]chan dnsReply),
 	}
 
 	ws.SetPongHandler(func(string) error {

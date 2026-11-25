@@ -125,6 +125,10 @@ type ProxyRouter struct {
 	defaultAction  RuleAction
 	geoipReader    *geoip2.Reader
 	cancel         context.CancelFunc
+
+	// 是否存在"无 no-resolve 的 IP 谓词规则"。false 时调用方不应触发任何
+	// DNS 查询（防泄漏第一性原理，见 NeedsIPResolution）。
+	needsIPResolution atomic.Bool
 }
 
 type DomainPattern struct {
@@ -827,6 +831,18 @@ const (
 	BehaviorClassical
 )
 
+func behaviorName(b ProviderBehavior) string {
+	switch b {
+	case BehaviorDomain:
+		return "domain"
+	case BehaviorIpCidr:
+		return "ipcidr"
+	case BehaviorClassical:
+		return "classical"
+	}
+	return "unknown"
+}
+
 type RuleProvider struct {
 	sourceType ProviderSourceType
 	behavior   ProviderBehavior
@@ -854,6 +870,9 @@ type RuleSet struct {
 	SourcePath string
 	Loaded     bool
 	LoadedAt   time.Time
+	// .mrs 精确域名（mihomo 语义：仅匹配该域本身，不含子域）。
+	// 后缀类条目（源文件的 "+.x" / ".x"）进 DomainTrie。
+	exactDomains map[string]bool
 }
 
 type ProxyConfig struct {
@@ -867,15 +886,95 @@ type RuleProviderConfig struct {
 	URL      string `yaml:"url,omitempty"`
 	Path     string `yaml:"path,omitempty"`
 	Interval int    `yaml:"interval,omitempty"`
+	// 可选：显式声明规则集格式（mrs/yaml/text）。缺省按文件头自动识别
+	// （zstd 帧头 → .mrs，明文 SRS → sing-box，其余按 UTF-8 文本）
+	Format string `yaml:"format,omitempty"`
 }
 
 func (rs *RuleSet) MatchesDomain(domain string) bool {
-	if !rs.Loaded || rs.DomainTrie == nil {
+	if !rs.Loaded {
+		return false
+	}
+	domain = strings.ToLower(domain)
+	if rs.exactDomains != nil && rs.exactDomains[domain] {
+		return true
+	}
+	if rs.DomainTrie == nil {
 		return false
 	}
 
 	_, found := rs.DomainTrie.Search(domain)
 	return found
+}
+
+// parseRuleSetBytes 按文件内容加载 provider（文本 / Clash YAML / .mrs）。
+// 格式判定顺序：显式 format 配置 → 文件头嗅探。
+func parseRuleSetBytes(name string, raw []byte, behavior ProviderBehavior) (*RuleSet, error) {
+	switch detectRuleFormat(raw) {
+	case mrsDetectedMrs:
+		return parseRuleSetMrs(name, raw, behavior)
+	case mrsDetectedSrs:
+		return nil, fmt.Errorf("不支持 sing-box .srs 规则集；请用 `sing-box rule-set decompile` 转成文本，或用 mihomo `convert-ruleset` 转成 .mrs")
+	default:
+		rs := &RuleSet{
+			Name:         name,
+			Behavior:     behavior,
+			DomainTrie:   NewDomainTrieNode(),
+			IPs:          make(map[string]bool),
+			exactDomains: make(map[string]bool),
+			Loaded:       true,
+			LoadedAt:     time.Now(),
+		}
+		processRuleSetLines(string(raw), rs)
+		logInfo("[路由] 规则集 %s 已加载（文本，%d 条 IP、域名 trie %d 节点）", name, len(rs.IPNets), len(rs.DomainTrie.children))
+		return rs, nil
+	}
+}
+
+// parseRuleSetMrs 解码 .mrs 并按 behavior 填充规则集（RS parse_mrs 对应物）
+func parseRuleSetMrs(name string, raw []byte, behavior ProviderBehavior) (*RuleSet, error) {
+	decoded, err := mrsParse(raw)
+	if err != nil {
+		return nil, fmt.Errorf(".mrs 解析失败: %w", err)
+	}
+
+	rs := &RuleSet{
+		Name:         name,
+		Behavior:     behavior,
+		DomainTrie:   NewDomainTrieNode(),
+		IPs:          make(map[string]bool),
+		exactDomains: make(map[string]bool),
+		Loaded:       true,
+		LoadedAt:     time.Now(),
+	}
+
+	switch {
+	case decoded.kind == mrsKindDomain && behavior == BehaviorDomain:
+		if decoded.declaredCount != len(decoded.domains) {
+			// 不是错误，但说明文件里精确/后缀被合并过，值得留一条线索
+			logDebug("[路由] .mrs %s: 头部声明 %d 条，trie 展开 %d 条", name, decoded.declaredCount, len(decoded.domains))
+		}
+		for _, entry := range decoded.domains {
+			lower := strings.ToLower(entry.name)
+			if entry.subOnly {
+				// ".x"（仅子域）：后缀匹配
+				rs.DomainTrie.Insert(lower, RuleActionNamed)
+			} else {
+				// 精确域名：仅匹配域本身（mihomo 语义）
+				rs.exactDomains[lower] = true
+			}
+		}
+	case decoded.kind == mrsKindIP && behavior == BehaviorIpCidr:
+		for _, ipNet := range decoded.nets {
+			rs.IPs[ipNet.String()] = true
+			rs.IPNets = append(rs.IPNets, ipNet)
+		}
+	default:
+		return nil, fmt.Errorf("behavior 不匹配：配置为 %s，但 .mrs 文件是 %s", behaviorName(behavior), decoded.kind)
+	}
+
+	logInfo("[路由] 规则集 %s 已加载 %d 条 (%s, .mrs)", name, decoded.declaredCount, behaviorName(behavior))
+	return rs, nil
 }
 
 func (rs *RuleSet) MatchesIP(ip net.IP) bool {
@@ -1098,13 +1197,12 @@ func (r *ProxyRouter) evalRule(rule *Rule, domain string, ip net.IP, dstPort uin
 			if rule.geoIP == "LAN" && isPrivateIP(ip) {
 				return RuleActionDirect
 			}
+			// 国家判定仅依赖 mmdb（GeoLite2-Country 等）；无数据库时 GEOIP
+			// 规则跳过（启动日志会提示），不再回退 chn_ip.txt 国 IP 列表
 			if country := r.getIPCountry(ip); country != "" {
 				if strings.EqualFold(rule.geoIP, country) {
 					return rule.action
 				}
-			}
-			if rule.geoIP == "CN" && IsChinaIP(ip) {
-				return RuleActionDirect
 			}
 		}
 
@@ -1185,18 +1283,11 @@ func (r *ProxyRouter) LoadRuleSet(name, path string, behavior ProviderBehavior) 
 		return err
 	}
 
-	rs := &RuleSet{
-		Name:       name,
-		Behavior:   behavior,
-		DomainTrie: NewDomainTrieNode(),
-		IPs:        make(map[string]bool),
-		IPNets:     make([]*net.IPNet, 0),
-		Loaded:     true,
-		LoadedAt:   time.Now(),
-		SourcePath: path,
+	rs, err := parseRuleSetBytes(name, data, behavior)
+	if err != nil {
+		return err
 	}
-
-	processRuleSetLines(string(data), rs)
+	rs.SourcePath = path
 
 	r.ruleSets[name] = rs
 	return nil
@@ -1240,19 +1331,12 @@ func (r *ProxyRouter) downloadRuleSetWithForce(name, url, path string, behavior 
 		logWarn("[路由] 保存缓存文件失败: %v", err)
 	}
 
-	rs := &RuleSet{
-		Name:       name,
-		Behavior:   behavior,
-		DomainTrie: NewDomainTrieNode(),
-		IPs:        make(map[string]bool),
-		IPNets:     make([]*net.IPNet, 0),
-		Loaded:     true,
-		LoadedAt:   time.Now(),
-		Source:     RuleSetURL,
-		SourcePath: path,
+	rs, err := parseRuleSetBytes(name, data, behavior)
+	if err != nil {
+		return err
 	}
-
-	processRuleSetLines(string(data), rs)
+	rs.Source = RuleSetURL
+	rs.SourcePath = path
 
 	r.ruleSets[name] = rs
 	logInfo("[路由] 下载规则集 %s 完成", name)
@@ -1325,6 +1409,7 @@ func (r *ProxyRouter) ParseYAML(content string, baseDir string) {
 
 	r.domainIndex.Build()
 	r.ipIndex.Build()
+	r.recomputeNeedsIPResolution()
 }
 
 func (r *ProxyRouter) ParseYAMLWithProviders(content string, baseDir string, providers map[string]RuleProvider) {
@@ -1376,6 +1461,7 @@ func (r *ProxyRouter) ParseYAMLWithProviders(content string, baseDir string, pro
 
 	r.domainIndex.Build()
 	r.ipIndex.Build()
+	r.recomputeNeedsIPResolution()
 }
 
 func (r *ProxyRouter) ParseRules(content string) {
@@ -1391,6 +1477,7 @@ func (r *ProxyRouter) ParseRules(content string) {
 			}
 		}
 	}
+	r.recomputeNeedsIPResolution()
 }
 
 // =============================================================================
@@ -1439,6 +1526,14 @@ func InitRouter(mode string, configPath string) {
 		}
 		logInfo("[路由] 模式: rule (自定义规则), 默认动作: %s", router.defaultAction.String())
 
+		// 规则未加载（rules.yaml 未找到/为空）时表现为"全局代理"，明确告警
+		// 提示放好规则文件，避免误以为分流已生效
+		if len(router.ruleSets) == 0 && len(router.domainTrie.children) == 0 &&
+			len(router.slowRules) == 0 && len(router.networkRules) == 0 && len(router.portRules) == 0 {
+			logWarn("[路由] 未加载到任何自定义规则（找不到或为空: %s），全部流量将按默认动作 %s 处理——请把 rules.yaml 与 ruleset/ 放到可执行文件同目录",
+				configPath, router.defaultAction.String())
+		}
+
 	default:
 		if _, err := os.Stat(mode); err == nil {
 			router.loadConfigFile(mode)
@@ -1453,6 +1548,8 @@ func InitRouter(mode string, configPath string) {
 	}
 	globalRouter = router
 	routerMu.Unlock()
+
+	router.recomputeNeedsIPResolution()
 }
 
 func (r *ProxyRouter) loadConfigFile(path string) {
@@ -1495,51 +1592,190 @@ func (r *ProxyRouter) loadConfigFile(path string) {
 }
 
 // =============================================================================
-// 并发控制工具
+// 路由分类（DNS 上游选组依据，移植自 ssp-client-rs router.rs）
 // =============================================================================
 
-type call struct {
-	wg  sync.WaitGroup
-	val interface{}
-	err error
-}
-
-type Group struct {
-	mu sync.Mutex
-	m  map[string]*call
-}
-
-func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
-	g.mu.Lock()
-	if g.m == nil {
-		g.m = make(map[string]*call)
+// ClassifyDomain 纯域名规则匹配（绝不触发 DNS）：
+// 命中 DIRECT 域名规则 → RouteClassDirect；其余（含未命中→defaultAction，
+// PROXY/REJECT/NAMED）→ RouteClassProxy。REJECT 的域名若被查询，用隧道 DNS
+// 至少不会泄漏给本地 ISP。
+func (r *ProxyRouter) ClassifyDomain(domain string) RouteClass {
+	action, ok := r.routeDomainOpt(domain)
+	if !ok {
+		action = r.defaultAction
 	}
-	if c, ok := g.m[key]; ok {
-		g.mu.Unlock()
-		c.wg.Wait()
-		return c.val, c.err
+	if action == RuleActionDirect {
+		return RouteClassDirect
 	}
-	c := new(call)
-	c.wg.Add(1)
-	g.m[key] = c
-	g.mu.Unlock()
-
-	c.val, c.err = fn()
-	c.wg.Done()
-
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
-
-	return c.val, c.err
+	return RouteClassProxy
 }
 
-var dnsSF = &Group{}
+// routeDomainOpt 仅域名规则匹配；未命中返回 false（调用方可据此决定是否需要
+// 解析 IP）。与 RS route_domain_opt 对齐：只看域名索引和"仅凭域名即可判定"
+// 的慢规则（DOMAIN-KEYWORD/REGEX、RULE-SET 域名行为、AND/OR/NOT 组合）。
+// IP 谓词（cncidr/geoip 等）在这里天然不生效——DNS 查询发生在拿到 IP 之前。
+func (r *ProxyRouter) routeDomainOpt(domain string) (RuleAction, bool) {
+	domain = strings.ToLower(domain)
+	if domain == "" {
+		return 0, false
+	}
+	if action, ok := r.domainIndex.exact[domain]; ok {
+		return action, true
+	}
+	if action, ok := r.domainTrie.Search(domain); ok {
+		return action, true
+	}
+	for _, rule := range r.slowRules {
+		switch rule.ruleType {
+		case RuleTypeDomain:
+			for _, dp := range rule.domains {
+				switch dp.patternType {
+				case DomainPatternKeyword:
+					if strings.Contains(domain, dp.keyword) {
+						return rule.action, true
+					}
+				case DomainPatternRegex:
+					if rule.compiledRegexp != nil && rule.compiledRegexp.MatchString(domain) {
+						return rule.action, true
+					}
+				}
+			}
+		case RuleTypeRuleSet:
+			if rs, ok := r.ruleSets[rule.ruleSetName]; ok && rs.Loaded && rs.MatchesDomain(domain) {
+				return rule.action, true
+			}
+		case RuleTypeAnd, RuleTypeOr, RuleTypeNot:
+			if action, ok := r.evalDomainLogical(rule, domain); ok {
+				return action, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// evalDomainLogical 域名阶段的逻辑规则求值：子规则里仅"凭域名即可判定"的
+// 谓词参与；IP/端口谓词不触发 DNS → 视为不匹配
+func (r *ProxyRouter) evalDomainLogical(rule *Rule, domain string) (RuleAction, bool) {
+	switch rule.ruleType {
+	case RuleTypeAnd:
+		for _, sub := range rule.subRules {
+			if _, ok := r.evalDomainSub(sub, domain); !ok {
+				return 0, false
+			}
+		}
+		return rule.action, true
+	case RuleTypeOr:
+		for _, sub := range rule.subRules {
+			if _, ok := r.evalDomainSub(sub, domain); ok {
+				return rule.action, true
+			}
+		}
+		return 0, false
+	case RuleTypeNot:
+		for _, sub := range rule.subRules {
+			if _, ok := r.evalDomainSub(sub, domain); ok {
+				return 0, false
+			}
+		}
+		return rule.action, true
+	}
+	return 0, false
+}
+
+func (r *ProxyRouter) evalDomainSub(rule *Rule, domain string) (RuleAction, bool) {
+	switch rule.ruleType {
+	case RuleTypeDomain:
+		for _, dp := range rule.domains {
+			switch dp.patternType {
+			case DomainPatternKeyword:
+				if strings.Contains(domain, dp.keyword) {
+					return rule.action, true
+				}
+			case DomainPatternRegex:
+				if rule.compiledRegexp != nil && rule.compiledRegexp.MatchString(domain) {
+					return rule.action, true
+				}
+			}
+		}
+	case RuleTypeRuleSet:
+		if rs, ok := r.ruleSets[rule.ruleSetName]; ok && rs.Loaded && rs.MatchesDomain(domain) {
+			return rule.action, true
+		}
+	case RuleTypeAnd, RuleTypeOr, RuleTypeNot:
+		return r.evalDomainLogical(rule, domain)
+	}
+	return 0, false
+}
+
+// NeedsIPResolution 路由是否存在"无 no-resolve 的 IP 谓词规则"。
+// false 时调用方不应触发任何 DNS 查询（防泄漏第一性原理）。
+func (r *ProxyRouter) NeedsIPResolution() bool {
+	return r.needsIPResolution.Load()
+}
+
+// ruleNeedsIP 单条规则是否为需要解析的 IP 谓词（RS rule_type_needs_ip 对应物）
+func (r *ProxyRouter) ruleNeedsIP(rule *Rule) bool {
+	if rule == nil || rule.noResolve {
+		return false
+	}
+	switch rule.ruleType {
+	case RuleTypeNetwork, RuleTypeIP:
+		return true
+	case RuleTypeGeoLocation:
+		return true
+	case RuleTypeRuleSet:
+		if rs, ok := r.ruleSets[rule.ruleSetName]; ok && rs.Loaded {
+			return rs.requiresResolution()
+		}
+		return false
+	case RuleTypeAnd, RuleTypeOr, RuleTypeNot:
+		for _, sub := range rule.subRules {
+			if r.ruleNeedsIP(sub) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// recomputeNeedsIPResolution 重新扫描规则集，更新"需要解析"标记。
+// 规则加载完成 / 规则集热更新后调用。
+func (r *ProxyRouter) recomputeNeedsIPResolution() {
+	need := false
+	for _, rule := range r.networkRules {
+		if r.ruleNeedsIP(rule) {
+			need = true
+			break
+		}
+	}
+	if !need {
+		for _, rule := range r.slowRules {
+			if r.ruleNeedsIP(rule) {
+				need = true
+				break
+			}
+		}
+	}
+	r.needsIPResolution.Store(need)
+	logInfo("[路由] needs-ip-resolution=%v", need)
+}
+
+// requiresResolution 规则集是否含 IP 谓词（domain 型规则集永远不需要解析）
+func (rs *RuleSet) requiresResolution() bool {
+	if rs.Behavior == BehaviorDomain {
+		return false
+	}
+	return len(rs.IPs) > 0 || len(rs.IPNets) > 0
+}
 
 // =============================================================================
-// 路由决策
+// 路由决策（防泄漏关键路径）
 // =============================================================================
 
+// RouteDomain 路由判定：域名规则 → 字面 IP 规则 → （需要时）DnsResolver 解析
+// 后按 IP 判定。解析走 DnsResolver（DIRECT → direct-nameserver，PROXY/未知 →
+// tunnel://），fail-closed：解析失败保留域名阶段结论，绝不回退系统 DNS。
 func RouteDomain(domain string, ip net.IP, port uint16) RuleAction {
 	router := GetRouter()
 	if router == nil {
@@ -1550,46 +1786,46 @@ func RouteDomain(domain string, ip net.IP, port uint16) RuleAction {
 		return router.Route(domain, ip, port, ProtoTCP, false)
 	}
 
-	if domain != "" {
+	if domain == "" {
+		return router.defaultAction
+	}
 
+	// 字面 IP：走 IP 规则（无需解析，对应 RS resolve_action 第 2 步）
+	if ipLit := net.ParseIP(domain); ipLit != nil {
+		return router.Route(domain, ipLit, port, ProtoTCP, false)
+	}
+
+	{
 		action := router.Route(domain, nil, port, ProtoTCP, false)
-
 		if action != router.defaultAction {
 			logDebug("[路由] 域名预匹配命中: %s -> %s (跳过解析)", domain, action.String())
 			return action
 		}
+
+		// 路由不存在"需要解析"的 IP 谓词规则：保持域名阶段结论，绝不触发 DNS
+		if !router.NeedsIPResolution() {
+			return router.defaultAction
+		}
 	}
 
-	if addrs, ok := globalDNSCache.get(domain); ok {
-		for _, addr := range addrs {
-			action := router.Route(domain, addr.IP, port, ProtoTCP, true)
-			if action != router.defaultAction {
-				return action
-			}
-		}
+	resolver := getDnsResolver()
+	if resolver == nil {
+		logDebug("[路由] DNS 解析器未就绪，%s 保留域名规则结果", domain)
 		return router.defaultAction
 	}
 
-	v, err := dnsSF.Do(domain, func() (interface{}, error) {
+	ips, err := resolver.Resolve(domain)
+	if err != nil {
+		// fail-closed：隧道断开/上游失败时，绝不静默改用系统 DNS
+		logDebug("[路由] %s 解析失败 (%v), 保留域名规则结果", domain, err)
+		return router.defaultAction
+	}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		return net.DefaultResolver.LookupIPAddr(ctx, domain)
-	})
-
-	if err == nil {
-		addrs := v.([]net.IPAddr)
-
-		globalDNSCache.set(domain, addrs)
-
-		for _, addr := range addrs {
-			action := router.Route(domain, addr.IP, port, ProtoTCP, true)
-			if action != router.defaultAction {
-				return action
-			}
+	for _, addr := range ips {
+		action := router.Route(domain, addr, port, ProtoTCP, true)
+		if action != router.defaultAction {
+			return action
 		}
-	} else {
-		logWarn("[路由] DNS 解析失败: %s (%v)", domain, err)
 	}
 
 	return router.defaultAction
@@ -1666,6 +1902,10 @@ func (r *ProxyRouter) updateStaleRuleSets() {
 					logWarn("[路由] 更新规则集失败 %s: %v", name, err)
 				} else {
 					logInfo("[路由] 规则集更新成功: %s", name)
+					// IP 型规则集可能带来新的 IP 谓词：更新"需要解析"标记
+					if rs.requiresResolution() {
+						r.needsIPResolution.Store(true)
+					}
 				}
 			}
 		}

@@ -1,99 +1,127 @@
-# rule-providers + RULE-SET 的新clash规则示例
-# 
-# 在 [rule-providers] 中声明规则集，在 [rules] 中用 RULE-SET 引用
-# 规则集来源于Loyalsoldier的clash-rules项目
-# 规则集会定期更新，适合想使用在线规则集的用户，或者需要定期更新规则的场景。
-# 注意：GEOIP，需要GeoLite2-Country.mmdb数据库文件: https://github.com/P3TERX/GeoLite.mmdb
+# ssp-client-go 分流规则示例（类 clash 语法，与 ssp-client-rs 的 rules.yaml 一致）
+#
+# 支持规则类型：DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX /
+#   IP-CIDR / IP-CIDR6 / SRC-IP-CIDR / GEOIP(含 LAN) / DST-PORT / SRC-PORT /
+#   PROCESS-NAME / PROCESS-PATH / NETWORK / RULE-SET / AND / OR / NOT / FINAL
+# 动作：PROXY / DIRECT / REJECT；IP 类规则可加 no-resolve（不做 DNS 解析判定）
+#
+# rule-providers 支持：
+#   type:    http / file
+#   behavior: domain / ipcidr / classical
+#   format:  mrs / yaml / text（缺省按文件头自动识别：zstd → .mrs）
+#   interval: 刷新间隔（秒），缺省不自动刷新
+#
+# 注意：
+#   - GEOIP 规则需 GeoLite2-Country.mmdb（放可执行文件同目录 mmdb/ 下）。
+#   - IP 类规则尽量带 no-resolve：路由判定就不需要解析域名（防泄漏第一性
+#     原则：能不解析就不解析），并让未命中域名规则的连接立即按默认动作处理。
+#   - 引擎特性：存在"无 no-resolve 的 IP 规则"时，未命中域名规则的连接才
+#     会经 DNS 解析（direct/proxy 分组）后按 IP 判定。
 
 rule-providers:
   reject:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/reject.txt"
-    path: ./ruleset/reject.yaml
-    interval: 86400 # 秒，86400 = 1天
-
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/reject.mrs"
+    path: ./ruleset/reject.mrs
+    interval: 86400
   icloud:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/icloud.txt"
-    path: ./ruleset/icloud.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/icloud.mrs"
+    path: ./ruleset/icloud.mrs
     interval: 86400
-
   apple:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/apple.txt"
-    path: ./ruleset/apple.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple.mrs"
+    path: ./ruleset/apple.mrs
     interval: 86400
-
   google:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/google.txt"
-    path: ./ruleset/google.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs"
+    path: ./ruleset/google.mrs
     interval: 86400
-
   proxy:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt"
-    path: ./ruleset/proxy.yaml
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/proxy.mrs"
+    path: ./ruleset/proxy.mrs
     interval: 86400
-
   direct:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/direct.txt"
-    path: ./ruleset/direct.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs"
+    path: ./ruleset/direct.mrs
     interval: 86400
-
   private:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/private.txt"
-    path: ./ruleset/private.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs"
+    path: ./ruleset/private.mrs
     interval: 86400
-
   gfw:
     type: http
     behavior: domain
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt"
-    path: ./ruleset/gfw.yaml
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/gfw.mrs"
+    path: ./ruleset/gfw.mrs
     interval: 86400
-
+  tld-not-cn:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/tld-!cn.mrs"
+    path: ./ruleset/tld-not-cn.mrs
+    interval: 86400
   telegramcidr:
     type: http
     behavior: ipcidr
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt"
-    path: ./ruleset/telegramcidr.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs"
+    path: ./ruleset/telegramcidr.mrs
     interval: 86400
-
   cncidr:
     type: http
     behavior: ipcidr
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/cncidr.txt"
-    path: ./ruleset/cncidr.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs"
+    path: ./ruleset/cncidr.mrs
     interval: 86400
-
   lancidr:
     type: http
     behavior: ipcidr
-    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/lancidr.txt"
-    path: ./ruleset/lancidr.yaml
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs"
+    path: ./ruleset/lancidr.mrs
     interval: 86400
-
   applications:
     type: http
     behavior: classical
     url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
     path: ./ruleset/applications.yaml
     interval: 86400
+  bm7ads:
+    type: http
+    behavior: domain
+    format: yaml
+    url: "https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/Advertising/Advertising_Domain.yaml"
+    path: ./ruleset/bm7ads.yaml
+    interval: 86400
 
 rules:
   - DOMAIN-SUFFIX,bing.com,PROXY
   - DOMAIN-SUFFIX,microsoft.com,PROXY
   - RULE-SET,reject,REJECT
+  - RULE-SET,bm7ads,REJECT
   - RULE-SET,private,DIRECT
   - RULE-SET,icloud,DIRECT
   - RULE-SET,apple,DIRECT

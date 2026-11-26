@@ -1,0 +1,139 @@
+# ssp-client-rs 分流规则示例（类 clash 语法）
+#
+# 支持规则类型：DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX /
+#   IP-CIDR / IP-CIDR6 / SRC-IP-CIDR / GEOIP(含 LAN) / DST-PORT / SRC-PORT /
+#   PROCESS-NAME / PROCESS-PATH / NETWORK / RULE-SET / AND / OR / NOT / FINAL
+# 动作：PROXY / DIRECT / REJECT；IP 类规则可加 no-resolve（不做 DNS 解析判定）
+#
+# rule-providers 支持：
+#   type:    http / file
+#   behavior: domain / ipcidr / classical
+#   format:  mrs / yaml / text（缺省按文件头自动识别：zstd → .mrs）
+#   interval: 刷新间隔（秒），缺省不自动刷新
+#
+# 注意：
+#   - GEOIP 规则需 GeoLite2-Country.mmdb；缺失时启动会自动从镜像下载到
+#     可执行文件同目录 mmdb/ 下。
+#   - IP 类规则尽量带 no-resolve：路由判定就不需要解析域名（防泄漏第一性
+#     原理：能不解析就不解析），并让未命中域名规则的连接立即按默认动作处理。
+#   - 引擎特性：存在"无 no-resolve 的 IP 规则"时，未命中域名规则的连接才
+#     会经 DNS 解析（direct/proxy 分组）后按 IP 判定。
+
+rule-providers:
+  reject:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/reject.mrs"
+    path: ./ruleset/reject.mrs
+    interval: 86400
+  icloud:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/icloud.mrs"
+    path: ./ruleset/icloud.mrs
+    interval: 86400
+  apple:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/apple.mrs"
+    path: ./ruleset/apple.mrs
+    interval: 86400
+  google:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/google.mrs"
+    path: ./ruleset/google.mrs
+    interval: 86400
+  proxy:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/proxy.mrs"
+    path: ./ruleset/proxy.mrs
+    interval: 86400
+  direct:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs"
+    path: ./ruleset/direct.mrs
+    interval: 86400
+  private:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs"
+    path: ./ruleset/private.mrs
+    interval: 86400
+  gfw:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://cdn.jsdelivr.net/gh/CRThu/clash-rules-mrs@release/loyalsoldier/gfw.mrs"
+    path: ./ruleset/gfw.mrs
+    interval: 86400
+  tld-not-cn:
+    type: http
+    behavior: domain
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/tld-!cn.mrs"
+    path: ./ruleset/tld-not-cn.mrs
+    interval: 86400
+  telegramcidr:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/telegram.mrs"
+    path: ./ruleset/telegramcidr.mrs
+    interval: 86400
+  cncidr:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs"
+    path: ./ruleset/cncidr.mrs
+    interval: 86400
+  lancidr:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs"
+    path: ./ruleset/lancidr.mrs
+    interval: 86400
+  applications:
+    type: http
+    behavior: classical
+    url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/applications.txt"
+    path: ./ruleset/applications.yaml
+    interval: 86400
+  bm7ads:
+    type: http
+    behavior: domain
+    format: yaml
+    url: "https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Clash/Advertising/Advertising_Domain.yaml"
+    path: ./ruleset/bm7ads.yaml
+    interval: 86400
+
+rules:
+  - DOMAIN-SUFFIX,bing.com,PROXY
+  - DOMAIN-SUFFIX,microsoft.com,PROXY
+  - RULE-SET,reject,REJECT
+  - RULE-SET,bm7ads,REJECT
+  - RULE-SET,private,DIRECT
+  - RULE-SET,icloud,DIRECT
+  - RULE-SET,apple,DIRECT
+  - RULE-SET,google,PROXY
+  - RULE-SET,proxy,PROXY
+  - RULE-SET,gfw,PROXY
+  - RULE-SET,telegramcidr,PROXY,no-resolve
+  - RULE-SET,applications,DIRECT
+  - RULE-SET,lancidr,DIRECT,no-resolve
+  - RULE-SET,cncidr,DIRECT,no-resolve
+  - RULE-SET,direct,DIRECT
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT,no-resolve
+  - FINAL,PROXY

@@ -1,19 +1,33 @@
-#![allow(unused)]
+//! 本地混合代理（SOCKS5 + HTTP）。
+//!
+//! 路由判定（防泄漏关键路径，参照 zks-client-cli proxy/mod.rs）：
+//! 1. 域名规则命中 → 直接返回，不触发任何 DNS；
+//! 2. 目标是字面 IP → 走 IP 规则（无需解析）；
+//! 3. 只有存在"无 no-resolve 的 IP 谓词规则"时才解析域名；
+//! 4. 解析走 `DnsResolver`（DIRECT → direct-nameserver，PROXY → tunnel://），
+//!    失败则保留域名规则结果 —— 绝不回退系统 DNS（fail-closed）。
+//!
+//! 协议握手（纯字节读取阶段）限时：防止"连上不发包"的呆客户端/端口扫描
+//! 挂着不动的连接泄漏任务。**数据转发绝不设总超时** —— 否则所有长连接
+//! （keep-alive 的 HTTPS、下载、视频）都会被定时杀掉。
 
-use crate::routing::{get_route_action, RouteDecision};
-use crate::{
-    build_open_payload, get_args, routing::should_bypass_proxy, ws::get_mux_pool, DIAL_TIMEOUT,
-};
+use crate::router::RuleAction;
+use crate::{mux::get_mux_pool, DIAL_TIMEOUT};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::{
     error::Error,
     io::Error as IoError,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    time::{timeout, Duration},
+    time::timeout,
 };
+
+/// 协议握手限时
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ==============================================================================
 // 对外函数入口
@@ -24,7 +38,7 @@ pub async fn run_proxy_server(addr: &str) {
     log::info!(
         "[代理] 监听 {} -> {}",
         addr,
-        mask_server_addr(&get_args().server)
+        mask_server_addr(&crate::get_args().server)
     );
 
     loop {
@@ -36,6 +50,181 @@ pub async fn run_proxy_server(addr: &str) {
                 log::debug!("[代理] Accept 错误: {}", e);
             }
         }
+    }
+}
+
+// ==============================================================================
+// 路由判定与直连建连（防泄漏关键路径）
+// ==============================================================================
+
+/// 去掉 SOCKS5 读出的 IPv6 方括号（`[::1]` → `::1`）。
+pub fn normalize_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// 路由判定：域名规则 → 字面 IP 规则 → （需要时）DnsResolver 解析后按 IP 判定。
+/// none/global 模式直接短路；rule 模式下规则未加载时降级为全局代理。
+pub async fn resolve_action(host: &str) -> RuleAction {
+    use crate::router::RoutingMode;
+    match crate::router::routing_mode() {
+        RoutingMode::None => return RuleAction::Direct,
+        RoutingMode::Global => return RuleAction::Proxy,
+        RoutingMode::Rule => {}
+    }
+
+    let Some(r) = crate::router::get_router() else {
+        return RuleAction::Proxy;
+    };
+    let host = normalize_host(host);
+
+    // 1. 域名规则命中：不触发任何 DNS
+    if let Some(action) = r.route_domain_opt(host) {
+        return action;
+    }
+
+    // 2. 字面 IP：走 IP 规则（无需解析）
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return r.route_ip(&ip);
+    }
+
+    // 3. 路由不存在"需要解析"的 IP 谓词规则：保持域名阶段结论，绝不触发 DNS
+    if !r.needs_ip_resolution() {
+        return r.default_action.clone();
+    }
+
+    // 4. 解析（DIRECT → direct-nameserver；PROXY/未知 → tunnel://），fail-closed
+    let Some(resolver) = crate::dns::get_resolver() else {
+        log::debug!(
+            "[路由] DNS 解析器未就绪，{} 保留域名规则结果",
+            host
+        );
+        return r.default_action.clone();
+    };
+
+    match resolver.resolve(host).await {
+        Ok(ips) => {
+            for ip in &ips {
+                if let Some(action) = r.route_ip_opt(ip) {
+                    log::debug!("[路由] {} → {} → IP 规则", host, ip);
+                    return action;
+                }
+            }
+            r.default_action.clone()
+        }
+        Err(e) => {
+            // fail-closed：隧道断开/上游失败时，绝不静默改用系统 DNS
+            log::debug!(
+                "[路由] {} 解析失败 ({}), 保留域名规则结果",
+                host,
+                e
+            );
+            r.default_action.clone()
+        }
+    }
+}
+
+/// Direct 分支连接：域名必须经 `DnsResolver` 解析，失败即拒绝（fail-closed）。
+///
+/// - 字面 IP / localhost → 不触发 DNS；
+/// - 其它域名 → resolver（按路由选 direct-nameserver / tunnel://）；
+///   没接线 resolver 时直接拒绝，绝不 `TcpStream::connect((host, port))`
+///   走系统解析。
+/// - 多个地址**并行竞速**（happy eyeballs 简化版）：geo 不符的第一个 IP
+///   不再拖住整个连接，避免 10s 干等变白屏。
+pub async fn connect_direct(
+    host: &str,
+    port: u16,
+    connect_timeout: Duration,
+) -> Result<TcpStream, String> {
+    let host = normalize_host(host);
+
+    let ips: Vec<IpAddr> = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![ip]
+    } else if host.eq_ignore_ascii_case("localhost") {
+        // 本地回环：绝不该把 localhost 送去远端 DoH
+        vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ]
+    } else {
+        let Some(resolver) = crate::dns::get_resolver() else {
+            return Err(format!(
+                "直连 {} 被拒绝: DNS 解析器未接线 (fail-closed)",
+                host
+            ));
+        };
+        resolver
+            .resolve(host)
+            .await
+            .map_err(|e| format!("直连解析 {}: {}", host, e))?
+    };
+
+    if ips.is_empty() {
+        return Err(format!("{} 没有可用地址", host));
+    }
+
+    let mut pending = ips
+        .into_iter()
+        .map(|ip| async move {
+            match timeout(
+                connect_timeout,
+                TcpStream::connect(SocketAddr::new(ip, port)),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    // 直连出口也关 Nagle：交互式流量（TLS 握手小包、SSH）最多可省 200ms
+                    let _ = stream.set_nodelay(true);
+                    Ok(stream)
+                }
+                Ok(Err(e)) => Err(format!("connect {}: {}", ip, e)),
+                Err(_) => Err(format!("connect {}: 超时", ip)),
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+
+    let mut last_err = None;
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("{} 没有可用地址", host)))
+}
+
+/// 解析 "host:port"（支持 [IPv6]:port）；缺省端口用 default_port
+pub fn parse_host_port(
+    host_port: &str,
+    default_port: u16,
+) -> Result<(String, u16), Box<dyn Error + Send + Sync>> {
+    if let Some(inner) = host_port.strip_prefix('[') {
+        let end = inner.find(']').ok_or("无效 IPv6 地址: 缺少 ']'")?;
+        let host = inner[..end].to_string();
+        let port = inner
+            .get(end + 2..)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return Ok((host, port));
+    }
+    let mut parts = host_port.rsplitn(2, ':');
+    match (parts.next(), parts.next()) {
+        (Some(port_str), Some(host)) => Ok((
+            host.to_string(),
+            port_str.parse().unwrap_or(default_port),
+        )),
+        _ => Ok((host_port.to_string(), default_port)),
+    }
+}
+
+fn log_action(action: &RuleAction, host: &str, port: u16, tag: &str) {
+    match action {
+        RuleAction::Proxy => log::info!("[{}] 🌐 PROXY  {}:{}", tag, host, port),
+        RuleAction::Direct => log::info!("[{}] ⚡ DIRECT {}:{}", tag, host, port),
+        RuleAction::Reject => log::info!("[{}] 🚫 REJECT {}:{}", tag, host, port),
+        RuleAction::Named(n) => log::info!("[{}] 🏷️  {} {}:{}", tag, n, host, port),
     }
 }
 
@@ -142,7 +331,10 @@ async fn handle_socks5(mut conn: TcpStream, peer: SocketAddr) {
             if conn.read_exact(&mut buf[..16]).await.is_err() {
                 return;
             }
-            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&buf[..16]).unwrap())).to_string()
+            IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(&buf[..16]).unwrap(),
+            ))
+            .to_string()
         }
         _ => {
             let _ = conn
@@ -156,7 +348,6 @@ async fn handle_socks5(mut conn: TcpStream, peer: SocketAddr) {
         return;
     }
     let port = u16::from_be_bytes([buf[0], buf[1]]);
-    let target = format!("{}:{}", host, port);
 
     if cmd != 0x01 {
         let _ = conn
@@ -164,28 +355,27 @@ async fn handle_socks5(mut conn: TcpStream, peer: SocketAddr) {
             .await;
         return;
     }
-    let r = match get_route_action(&host).await {
-        RouteDecision::Reject => {
-            log::info!("[SOCKS5] 🚫 REJECT {}", host);
+
+    let host = normalize_host(&host).to_string();
+    let action = resolve_action(&host).await;
+    log_action(&action, &host, port, "SOCKS5");
+    let r = match action {
+        RuleAction::Reject => {
             // SOCKS5 错误码 0x02 = Connection not allowed by ruleset
             let _ = conn
                 .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await;
-            return;
+            Ok(())
         }
-        RouteDecision::Direct => {
-            log::info!("[SOCKS5] ⚡ DIRECT {}", host);
-            handle_direct(conn, &target, peer, 1, vec![]).await
-        }
-        RouteDecision::Tunnel => {
-            log::info!("[SOCKS5] 🌐 PROXY  {}", host);
-            handle_tunnel(conn, &target, peer, 1, vec![]).await
+        RuleAction::Direct => handle_direct(conn, &host, port, peer, 1, vec![]).await,
+        RuleAction::Proxy | RuleAction::Named(_) => {
+            handle_tunnel(conn, &format!("{}:{}", host, port), peer, 1, vec![]).await
         }
     };
     if let Err(e) = r {
         let s = e.to_string();
         if !s.contains("broken pipe") && !s.contains("connection reset") && !s.contains("EOF") {
-            log::debug!("[SOCKS5] {} 错误: {}", peer, s);
+            log::warn!("[SOCKS5] {} 错误: {}", peer, s);
         }
     }
 }
@@ -193,7 +383,7 @@ async fn handle_socks5(mut conn: TcpStream, peer: SocketAddr) {
 async fn handle_http(mut conn: TcpStream, peer: SocketAddr, first_byte: u8) {
     let mut head = vec![first_byte];
     let mut tmp = vec![0u8; 8192];
-    match timeout(Duration::from_secs(5), conn.read(&mut tmp)).await {
+    match timeout(HANDSHAKE_TIMEOUT, conn.read(&mut tmp)).await {
         Ok(Ok(n)) if n > 0 => head.extend_from_slice(&tmp[..n]),
         _ => return,
     }
@@ -215,30 +405,30 @@ async fn handle_http(mut conn: TcpStream, peer: SocketAddr, first_byte: u8) {
     }
 
     if method == "CONNECT" {
-        //  HTTPS代理
-        let thost = url.split(':').next().unwrap_or(url);
-        let r = match get_route_action(thost).await {
-            RouteDecision::Reject => {
-                log::info!("[HTTPS] 🚫 REJECT  {}", thost);
+        // HTTPS代理
+        let Ok((host, port)) = parse_host_port(url, 443) else {
+            return;
+        };
+        let action = resolve_action(&host).await;
+        log_action(&action, &host, port, "HTTPS");
+        let r = match action {
+            RuleAction::Reject => {
                 let _ = conn
                     .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                     .await;
-                return;
+                Ok(())
             }
-            RouteDecision::Direct => {
-                log::info!("[HTTPS] ⚡ DIRECT {}", thost);
-                handle_direct(conn, url, peer, 2, vec![]).await
-            }
-            RouteDecision::Tunnel => {
-                log::info!("[HTTPS] 🌐 PROXY {}", thost);
-                handle_tunnel(conn, url, peer, 2, vec![]).await
+            RuleAction::Direct => handle_direct(conn, &host, port, peer, 2, vec![]).await,
+            RuleAction::Proxy | RuleAction::Named(_) => {
+                handle_tunnel(conn, &format!("{}:{}", host, port), peer, 2, vec![]).await
             }
         };
         if let Err(e) = r {
-            log::debug!("[HTTPS CONNECT] {}", e);
+            log::warn!("[HTTPS CONNECT] {}", e);
         }
         return;
     }
+
     // http代理 => 普通HTTP
     if host_hdr.is_empty() {
         return;
@@ -247,26 +437,25 @@ async fn handle_http(mut conn: TcpStream, peer: SocketAddr, first_byte: u8) {
         true => host_hdr.clone(),
         false => format!("{}:80", host_hdr),
     };
-    let thost = target.split(':').next().unwrap_or(&host_hdr).to_string();
-    let r = match get_route_action(&thost).await {
-        RouteDecision::Reject => {
-            log::info!("[HTTP] 🚫 REJECT {}", thost);
+    let Ok((host, port)) = parse_host_port(&target, 80) else {
+        return;
+    };
+    let action = resolve_action(&host).await;
+    log_action(&action, &host, port, "HTTP");
+    let r = match action {
+        RuleAction::Reject => {
             let _ = conn
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await;
-            return;
+            Ok(())
         }
-        RouteDecision::Direct => {
-            log::info!("[HTTP] ⚡ DIRECT {}", thost);
-            handle_direct(conn, &target, peer, 3, head).await
-        }
-        RouteDecision::Tunnel => {
-            log::info!("[HTTP] 🌐 PROXY {}", thost);
+        RuleAction::Direct => handle_direct(conn, &host, port, peer, 3, head).await,
+        RuleAction::Proxy | RuleAction::Named(_) => {
             handle_tunnel(conn, &target, peer, 3, head).await
         }
     };
     if let Err(e) = r {
-        log::debug!("[HTTP] {}", e);
+        log::warn!("[HTTP] {}", e);
     }
 }
 
@@ -274,24 +463,20 @@ async fn handle_http(mut conn: TcpStream, peer: SocketAddr, first_byte: u8) {
 // 直连 and 隧道代理
 // ==============================================================================
 
-/// 直连
+/// 直连（域名经 DnsResolver 解析，fail-closed + happy eyeballs）
 async fn handle_direct(
     mut conn: TcpStream,
-    target: &str,
-    peer: SocketAddr,
+    host: &str,
+    port: u16,
+    _peer: SocketAddr,
     mode: i32,
     first_payload: Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let target = ensure_port(target, mode);
-    let mut remote = match timeout(DIAL_TIMEOUT, TcpStream::connect(&target)).await {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
+    let mut remote = match connect_direct(host, port, DIAL_TIMEOUT).await {
+        Ok(c) => c,
+        Err(e) => {
             send_error(&mut conn, mode).await;
             return Err(format!("直连失败: {}", e).into());
-        }
-        Err(_) => {
-            send_error(&mut conn, mode).await;
-            return Err("直连超时".into());
         }
     };
     send_success(&mut conn, mode).await?;
@@ -311,7 +496,6 @@ async fn handle_direct(
             w1.shutdown().await
         },
     )?;
-    // log::debug!("[直连] 断开: {} -> {}", peer, target);
     Ok(())
 }
 
@@ -319,11 +503,12 @@ async fn handle_direct(
 async fn handle_tunnel(
     mut conn: TcpStream,
     target: &str,
-    peer: SocketAddr,
+    _peer: SocketAddr,
     resp_mode: i32,
     first_frame: Vec<u8>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // 1. 从连接池获取一条逻辑流
+    // 1. 从连接池获取一条逻辑流（mux 层已等服务端 ACK：
+    //    某槽被拒/超时会自动换下一槽，全部失败才返回错误）
     let (sink, mut source) = match get_mux_pool().open_stream(target).await {
         Ok(v) => v,
         Err(e) => {
@@ -334,18 +519,7 @@ async fn handle_tunnel(
     let sid = sink.sid;
     log::debug!("[隧道] sid={} -> {}", sid, target);
 
-    // 2. 等待服务端 ACK
-    //    服务端成功建立后端 TCP 时发空 TYPE_DATA；
-    //    超出 MAX_CONNECTIONS 时发 TYPE_CLOSE → recv() 返回 None。
-    match source.recv().await {
-        None => {
-            send_error(&mut conn, resp_mode).await;
-            return Err(format!("服务端拒绝连接 sid={} target={}", sid, target).into());
-        }
-        Some(_) => {}
-    }
-
-    // 3. 通知客户端就绪
+    // 2. 通知客户端就绪
     send_success(&mut conn, resp_mode).await?;
 
     // 4. 发送缓冲的请求头
@@ -408,13 +582,6 @@ async fn handle_tunnel(
 // ==============================================================================
 // 辅助函数
 // ==============================================================================
-
-fn ensure_port(target: &str, mode: i32) -> String {
-    match target.contains(":") {
-        true => target.to_string(),
-        false => format!("{}:{}", target, if mode == 2 { "443" } else { "80" }),
-    }
-}
 
 async fn send_error(conn: &mut TcpStream, mode: i32) {
     let _ = conn

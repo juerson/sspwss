@@ -2,7 +2,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "ssp-echwks-do",
 	"main": "src/index.js",
-	"compatibility_date": "2025-11-09",
+	"compatibility_date": "2026-11-25",
 	"migrations": [
 		{
 			"new_sqlite_classes": [
@@ -25,5 +25,11 @@
 	"vars": {
 		"PSK": "2kWBzSkmVVkvv7wst8la",
 		"CF_FALLBACK_IPS": "152.32.181.246:44070" // 等价PROXYIP，会失效。
+		// 以下均为可选环境变量（与普通 Worker 版本一致）：
+		// "DOHDNS_URL": "https://1.1.1.1/dns-query", // DNS 帧(v1.5) DoH 上游，默认 1.1.1.1
+		// "MAX_CONNECTIONS": "32",                  // 每会话并发流上限，默认 32
+		// "SUBREQUEST_BUDGET": "45",                // 每会话子请求预算，默认 45（付费计划可调高）
+		// "BYTES_BUDGET": "128",                    // 每会话流量预算(MB)，默认 128
+		// "LOG_LEVEL": "ERROR"                      // DEBUG/INFO/WARN/ERROR，默认 ERROR
 	}
 }
